@@ -600,9 +600,12 @@ class Docker {
             '容器命令失败（exitCode=' + result.ExitCode + ', running=' + result.Running + '）: ' + output.stderr.trim())
         return output.stdout
     }
-    async probe(image, cmd) {
+    async probe(image, cmd, { Binds, Mounts } = {}) {
+        // A preflight must not relabel a host file still used by the old service.
+        ensure(!Binds?.some(bind => bind.split(':').at(-1).split(',').some(mode => mode === 'z' || mode === 'Z')),
+            '.env 挂载含 SELinux 自动重标记选项（z/Z），需要手动适配，原容器未停止')
         const created = await this.create('', { Image: image, Entrypoint: ['node'], Cmd: cmd,
-            HostConfig: { NetworkMode: 'none' }, Healthcheck: { Test: ['NONE'] },
+            HostConfig: { NetworkMode: 'none', Binds, Mounts }, Healthcheck: { Test: ['NONE'] },
             Labels: { 'io.astro.migration.role': 'probe' } })
         try {
             await this.start(created.Id)
@@ -661,12 +664,13 @@ class Migration {
         })
         this.checkSignal()
     }
-    async checkEnv(id, options, info) {
+    async checkEnv(image, options, info) {
         if (!options.envMount) return
         log('沿用原 .env 挂载: ' + options.envMount.Source + (options.envMount.RW ? '（读写）' : '（只读）'))
         try {
-            await this.api.exec(id, ['node', '-e', ENV_PROBE, options.envMount.RW ? 'rw' : 'ro'],
-                info.uid + ':' + info.gid)
+            // Test the original host mount in the target image as its default user.
+            // Old root-owned application directories may legitimately be mode 0700.
+            await this.api.probe(image, ['-e', ENV_PROBE, options.envMount.RW ? 'rw' : 'ro'], options.host)
         } catch (error) {
             throw Error('原 .env 挂载预检查失败（UID/GID ' + info.uid + '/' + info.gid +
                 '，源文件 ' + options.envMount.Source + '）: ' + error.message)
@@ -814,7 +818,7 @@ class Migration {
             !image.Config.Entrypoint?.length, '新镜像不符合标准 Astro 启动布局')
         const info = JSON.parse(await api.probe(image.Id, ['-e', IMAGE_PROBE]))
         log('镜像检查通过：Node ' + info.node + ' / Astro ' + info.version)
-        await this.checkEnv(old.Id, options, info)
+        await this.checkEnv(image.Id, options, info)
         this.checkSignal()
         if (a.check) { log('检查完成，原容器未停止，未创建迁移备份。'); return }
         log('统计旧应用目录体积，大目录可能耗时较长（最多等待 10 分钟）')
