@@ -2,6 +2,7 @@
 # Self-contained host launcher. All structured work runs inside the Node 26 image.
 set -Eeuo pipefail
 umask 077
+SCRIPT_VERSION=v1
 CONTAINER=astro-app
 IMAGE=astrobtc/astro:3.3
 BACKUP_BASE=/var/backups/astro-node26
@@ -12,6 +13,7 @@ HEALTH_TIMEOUT=180
 WORK=
 RUN_PID=
 log() { printf '[astro-node26] %s\n' "$*"; }
+log "迁移脚本版本: $SCRIPT_VERSION"
 die() { log "ERROR: $*" >&2; exit 1; }
 usage() {
   cat <<HELP
@@ -281,6 +283,16 @@ const DATA_PROBE = '(' + function runtimeDataProbe() {
 const ENV_PROBE = '(' + function envProbe() {
     const fs = require('fs'), file = '/home/ubuntu/astro-server/.env'
     try {
+        if (process.argv[1] === 'fix') {
+            const fd = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK)
+            try {
+                const stat = fs.fstatSync(fd)
+                if (!stat.isFile() || stat.nlink !== 1) throw Error('.env 不是独立的普通文件，停止权限修复')
+                fs.fchownSync(fd, Number(process.argv[2]), Number(process.argv[3]))
+                fs.fchmodSync(fd, 0o600)
+            } finally { fs.closeSync(fd) }
+            return
+        }
         if (!fs.statSync(file).isFile()) throw Error('.env 不是普通文件')
         fs.accessSync(file, fs.constants.R_OK | (process.argv[1] === 'rw' ? fs.constants.W_OK : 0))
     } catch (error) {
@@ -600,11 +612,11 @@ class Docker {
             '容器命令失败（exitCode=' + result.ExitCode + ', running=' + result.Running + '）: ' + output.stderr.trim())
         return output.stdout
     }
-    async probe(image, cmd, { Binds, Mounts } = {}) {
+    async probe(image, cmd, { Binds, Mounts, User } = {}) {
         // A preflight must not relabel a host file still used by the old service.
         ensure(!Binds?.some(bind => bind.split(':').at(-1).split(',').some(mode => mode === 'z' || mode === 'Z')),
             '.env 挂载含 SELinux 自动重标记选项（z/Z），需要手动适配，原容器未停止')
-        const created = await this.create('', { Image: image, Entrypoint: ['node'], Cmd: cmd,
+        const created = await this.create('', { Image: image, Entrypoint: ['node'], Cmd: cmd, User,
             HostConfig: { NetworkMode: 'none', Binds, Mounts }, Healthcheck: { Test: ['NONE'] },
             Labels: { 'io.astro.migration.role': 'probe' } })
         try {
@@ -670,7 +682,18 @@ class Migration {
         try {
             // Test the original host mount in the target image as its default user.
             // Old root-owned application directories may legitimately be mode 0700.
-            await this.api.probe(image, ['-e', ENV_PROBE, options.envMount.RW ? 'rw' : 'ro'], options.host)
+            const check = () => this.api.probe(image, ['-e', ENV_PROBE, options.envMount.RW ? 'rw' : 'ro'], options.host)
+            try { await check() }
+            catch (error) {
+                if (this.args.check || !/权限不足（(?:EACCES|EPERM)）/.test(error.message)) throw error
+                log('仅修复原 .env 文件权限: ' + options.envMount.Source + ' → ' + info.uid + ':' + info.gid + ' / 600')
+                await this.api.probe(image, ['-e', ENV_PROBE, 'fix', String(info.uid), String(info.gid)], {
+                    User: '0', Mounts: [{ Type: 'bind', Source: options.envMount.Source,
+                        Target: ROOT + '/astro-server/.env', ReadOnly: false }],
+                })
+                await check()
+                log('.env 文件权限修复并检查通过，文件内容及原挂载方式保持不变。')
+            }
         } catch (error) {
             throw Error('原 .env 挂载预检查失败（UID/GID ' + info.uid + '/' + info.gid +
                 '，源文件 ' + options.envMount.Source + '）: ' + error.message)
